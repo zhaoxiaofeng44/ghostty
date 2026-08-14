@@ -524,6 +524,9 @@ extension Ghostty {
             case GHOSTTY_ACTION_PWD:
                 pwdChanged(app, target: target, v: action.action.pwd)
 
+            case GHOSTTY_ACTION_RESTORE_COMMAND:
+                restoreCommandChanged(app, target: target, v: action.action.restore_command)
+
             case GHOSTTY_ACTION_OPEN_CONFIG:
                 openConfig(app)
 
@@ -1785,7 +1788,33 @@ extension Ghostty {
                 guard let surface = target.target.surface else { return }
                 guard let surfaceView = self.surfaceView(from: surface) else { return }
                 guard let pwd = String(cString: v.pwd!, encoding: .utf8) else { return }
-                surfaceView.pwd = pwd
+                surfaceView.recordWorkingDirectory(pwd)
+                if let controller = BaseTerminalController.controller(owning: surfaceView) as? TerminalController,
+                   controller.isPersistentSession {
+                    Task { @MainActor in
+                        DefaultWindowSessionStore.shared.schedulePwdSave()
+                    }
+                }
+
+            default:
+                assertionFailure()
+            }
+        }
+
+        private static func restoreCommandChanged(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            v: ghostty_action_restore_command_s) {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                Ghostty.logger.warning("restore command change does nothing with an app target")
+                return
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return }
+                guard let surfaceView = self.surfaceView(from: surface) else { return }
+                guard let command = String(cString: v.restore_command!, encoding: .utf8) else { return }
+                surfaceView.restoreCommand = command.isEmpty ? nil : command
 
             default:
                 assertionFailure()

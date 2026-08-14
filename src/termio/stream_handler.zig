@@ -320,6 +320,7 @@ pub const StreamHandler = struct {
             .decaln => try self.decaln(),
             .window_title => try self.windowTitle(value.title),
             .report_pwd => try self.reportPwd(value.url),
+            .restore_command => try self.restoreCommand(value.command),
             .show_desktop_notification => try self.showDesktopNotification(value.title, value.body),
             .progress_report => self.progressReport(value),
             .start_hyperlink => try self.startHyperlink(value.uri, value.id),
@@ -1116,6 +1117,16 @@ pub const StreamHandler = struct {
         if (!self.seen_title) {
             try self.windowTitle(path);
             self.seen_title = false;
+        }
+    }
+
+    fn restoreCommand(self: *StreamHandler, value: []const u8) !void {
+        // Report it to the surface. If creating our write request fails
+        // then we just ignore it.
+        if (apprt.surface.Message.WriteReq.init(self.alloc, value)) |req| {
+            self.surfaceMessageWriter(.{ .restore_command_change = req });
+        } else |err| {
+            log.warn("error notifying surface of restore command change err={}", .{err});
         }
     }
 

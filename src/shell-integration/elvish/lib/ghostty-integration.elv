@@ -89,6 +89,9 @@
     if (not (has-value $features ssh-terminfo)) {
       set flags = (conj $flags --terminfo=false)
     }
+    if (has-value $features ssh-persist) {
+      set flags = (conj $flags --persist)
+    }
     $ghostty +ssh $@flags -- $@args
   }
 

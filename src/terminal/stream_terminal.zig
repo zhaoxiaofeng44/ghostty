@@ -392,6 +392,7 @@ pub const Handler = struct {
             // Have no terminal-modifying effect
             .title_push,
             .title_pop,
+            .restore_command,
             => {},
         }
     }

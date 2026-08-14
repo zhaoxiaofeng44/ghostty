@@ -25,6 +25,7 @@ const Key = enum {
     File,
     FileEnd,
     FilePart,
+    GhosttyRestoreCommand,
     HighlightCursorLine,
     MultipartFile,
     OpenURL,
@@ -151,6 +152,17 @@ pub fn parse(parser: *Parser, _: ?u8) ?*Command {
                     .value = value,
                 },
             };
+            return &parser.command;
+        },
+
+        .GhosttyRestoreCommand => {
+            // Unlike most other keys, an empty value is valid: it clears
+            // the restore command (e.g. when an SSH session exits).
+            const value = value_ orelse {
+                parser.command = .invalid;
+                return null;
+            };
+            parser.command = .{ .restore_command = value };
             return &parser.command;
         },
 
@@ -432,4 +444,58 @@ test "OSC: 1337: test CurrentDir with non-empty value" {
     const cmd = p.end('\x1b').?.*;
     try testing.expect(cmd == .report_pwd);
     try testing.expectEqualStrings("abc123", cmd.report_pwd.value);
+}
+
+test "OSC: 1337: test GhosttyRestoreCommand with no value" {
+    const testing = std.testing;
+
+    var p: Parser = .init(testing.allocator);
+    defer p.deinit();
+
+    const input = "1337;GhosttyRestoreCommand";
+    for (input) |ch| p.next(ch);
+
+    try testing.expect(p.end('\x1b') == null);
+}
+
+test "OSC: 1337: test GhosttyRestoreCommand with empty value" {
+    const testing = std.testing;
+
+    var p: Parser = .init(testing.allocator);
+    defer p.deinit();
+
+    const input = "1337;GhosttyRestoreCommand=";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end('\x1b').?.*;
+    try testing.expect(cmd == .restore_command);
+    try testing.expectEqualStrings("", cmd.restore_command);
+}
+
+test "OSC: 1337: test GhosttyRestoreCommand with non-empty value" {
+    const testing = std.testing;
+
+    var p: Parser = .init(testing.allocator);
+    defer p.deinit();
+
+    const input = "1337;GhosttyRestoreCommand=ssh user@example.com";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end('\x1b').?.*;
+    try testing.expect(cmd == .restore_command);
+    try testing.expectEqualStrings("ssh user@example.com", cmd.restore_command);
+}
+
+test "OSC: 1337: test GhosttyRestoreCommand with value containing equals sign" {
+    const testing = std.testing;
+
+    var p: Parser = .init(testing.allocator);
+    defer p.deinit();
+
+    const input = "1337;GhosttyRestoreCommand=ssh -o Foo=bar user@example.com";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end('\x1b').?.*;
+    try testing.expect(cmd == .restore_command);
+    try testing.expectEqualStrings("ssh -o Foo=bar user@example.com", cmd.restore_command);
 }
