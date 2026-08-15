@@ -6,6 +6,7 @@ const cli_args = @import("args.zig");
 const diagnostics = @import("diagnostics.zig");
 const Action = @import("ghostty.zig").Action;
 const DiskCache = @import("ssh_cache.zig").DiskCache;
+const persist = @import("persist.zig");
 const internal_os = @import("../os/main.zig");
 const ghostty_terminfo = @import("../terminfo/main.zig").ghostty;
 const global = @import("../global.zig");
@@ -19,6 +20,11 @@ const usage =
     \\  --forward-env[=bool]  Enable TERM / SendEnv forwarding. Default: true.
     \\  --terminfo[=bool]     Install Ghostty terminfo on first connect. Default: true.
     \\  --cache[=bool]        Use the terminfo install cache. Default: true.
+    \\  --persist[=bool]      Run interactive sessions inside a persistent
+    \\                        Ghostty-managed session that survives the
+    \\                        local terminal closing. Default: false.
+    \\  --persist-session=<name> Override the session name. Default: derived
+    \\                        from the resolved destination (user@host).
     \\  --ssh=<path>          Path to the ssh binary. Default: first `ssh` on PATH.
     \\  --verbose             Print +ssh status lines to stderr.
     \\  --help                Show full help.
@@ -39,6 +45,19 @@ pub const Options = struct {
 
     /// When false, both cache read and write are bypassed.
     cache: bool = true,
+
+    /// Maps to the `ssh-persist` shell integration feature. When true,
+    /// interactive sessions run inside a persistent Ghostty-managed
+    /// session (`ghostty +persist`): the ssh process lives in a PTY
+    /// owned by a background server, so the connection and its remote
+    /// processes survive the local terminal closing and can be
+    /// reattached later. This replaces the need for tmux on the remote
+    /// host.
+    persist: bool = false,
+
+    /// Override the persist session name. By default the session name is
+    /// derived from the resolved ssh destination (user@host).
+    @"persist-session": ?[]const u8 = null,
 
     /// The wrapped `ssh` binary.
     /// `/`-containing values are treated as paths; otherwise resolved via PATH.
@@ -118,7 +137,7 @@ pub const Options = struct {
 /// `alias ssh='ghostty +ssh --'`) if you prefer not to use the shell
 /// integration.
 ///
-/// `+ssh` performs up to two pieces of setup before launching `ssh`:
+/// `+ssh` performs up to three pieces of setup before launching `ssh`:
 ///
 ///   1. **Environment forwarding** (`--forward-env`). Sets `TERM` to
 ///      `xterm-256color` and requests `SendEnv` forwarding of
@@ -134,6 +153,21 @@ pub const Options = struct {
 ///      (see `ghostty +ssh-cache`) so subsequent connections skip this
 ///      step. When terminfo is successfully installed or already cached,
 ///      `TERM` is set to `xterm-ghostty` instead of `xterm-256color`.
+///
+///   3. **Persistent sessions** (`--persist`). Interactive sessions (no
+///      remote command) run inside a Ghostty-managed daemon
+///      (`ghostty +persist`): the ssh process lives in a PTY owned by a
+///      background server, so closing the local terminal leaves the
+///      connection and its remote processes running. Running the same
+///      `ssh` command again — which Ghostty does automatically when a
+///      surface is restored — reattaches to the session and replays
+///      recent output. If the connection itself is lost (network drop,
+///      sshd restart), the server reconnects with backoff while the
+///      session lives. The session name is derived
+///      from the resolved destination (`user@host`) and can be
+///      overridden with `--persist-session`. This replaces the usual
+///      "run tmux on the remote host" workflow; nothing needs to be
+///      installed remotely.
 ///
 /// If `--terminfo` install fails (e.g. `tic` not available on the
 /// remote, filesystem permissions), a warning is logged and the
@@ -153,6 +187,13 @@ pub const Options = struct {
 ///     connection performs the install. To one-shot reinstall a single
 ///     host while keeping the cache in use, prefer `ghostty +ssh-cache
 ///     --remove=<host>` followed by a normal connection.
+///
+///   * `--persist=<bool>`: Run interactive sessions inside a persistent
+///     Ghostty-managed session. Default: `false`.
+///
+///   * `--persist-session=<name>`: Override the persist session name.
+///     Default: `ghostty-<user>-<host>` derived from the resolved
+///     destination.
 ///
 ///   * `--ssh=<path>`: Path to the `ssh` binary to execute. Default: the
 ///     first `ssh` found on `PATH`.
@@ -232,13 +273,20 @@ fn runInner(
         return 2;
     }
 
+    // Resolve the destination once if any feature needs it. This runs
+    // `ssh -G` which reads the user's ssh configuration.
+    const resolved_dest: ?[]const u8 = if (opts.terminfo or opts.persist)
+        resolveDestination(alloc, opts.ssh, opts._ssh_args.items)
+    else
+        null;
+
     const session: struct {
         term: []const u8,
         to_cache: ?struct { cache: DiskCache, dest: []const u8 } = null,
     } = session: {
         if (!opts.terminfo) break :session .{ .term = "xterm-256color" };
 
-        const dest = resolveDestination(alloc, opts.ssh, opts._ssh_args.items) orelse {
+        const dest = resolved_dest orelse {
             warnPrint(stderr, "could not resolve ssh destination; skipping terminfo install", .{});
             break :session .{ .term = "xterm-256color" };
         };
@@ -284,6 +332,25 @@ fn runInner(
         };
     };
 
+    // Determine whether we will run inside a persistent session.
+    const persist_plan: ?struct { session: []const u8 } = plan: {
+        if (!opts.persist) break :plan null;
+
+        _ = interactiveDestIdx(opts._ssh_args.items) orelse {
+            verbosePrint(opts, stderr, "persist: not an interactive ssh session; skipping", .{});
+            break :plan null;
+        };
+
+        const dest = resolved_dest orelse {
+            warnPrint(stderr, "could not resolve ssh destination; skipping persistent session", .{});
+            break :plan null;
+        };
+
+        const session_name = opts.@"persist-session" orelse try persist.sessionName(alloc, dest);
+        verbosePrint(opts, stderr, "persist: session {s}", .{session_name});
+        break :plan .{ .session = session_name };
+    };
+
     // Build the full argv: [ssh, ...our opts, ...user args]
     const env_opts: []const []const u8 = if (opts.@"forward-env") env_opts: {
         const set_term = try std.fmt.allocPrint(
@@ -305,10 +372,33 @@ fn runInner(
     });
     verbosePrint(opts, stderr, "exec: {f}", .{Joined{ .items = argv }});
 
-    const exit_code = childExec(argv) catch |err| {
-        try stderr.print("Error: failed to run {s}: {t}\n", .{ argv[0], err });
-        return 1;
+    // Notify the terminal of the command that restores this session so
+    // that it can be re-run when the surface is restored. This is only
+    // done for persistent sessions since otherwise there is nothing
+    // persistent to restore.
+    if (persist_plan != null) writeRestoreCommand(alloc, opts._ssh_args.items);
+
+    const exit_code = exit_code: {
+        if (persist_plan) |plan| {
+            // The ssh process runs inside the persist server's PTY and
+            // this process becomes the attach client. When the attach
+            // ends (terminal closed, or the remote session exited) the
+            // server keeps the PTY alive for the next attach. The
+            // server also restarts ssh with backoff when the connection
+            // is lost (ssh exit 255) instead of ending the session.
+            break :exit_code persist.attachCommand(gpa, plan.session, argv, true) catch |err| {
+                writeRestoreCommand(alloc, null);
+                try stderr.print("Error: failed to run {s}: {t}\n", .{ argv[0], err });
+                return 1;
+            };
+        }
+
+        break :exit_code childExec(argv) catch |err| {
+            try stderr.print("Error: failed to run {s}: {t}\n", .{ argv[0], err });
+            return 1;
+        };
     };
+    if (persist_plan != null) writeRestoreCommand(alloc, null);
     verbosePrint(opts, stderr, "exit: {d}", .{exit_code});
 
     // Attempt to cache (if needed) on a successful ssh execution.
@@ -559,6 +649,131 @@ fn childExec(argv: []const []const u8) !u8 {
     };
 }
 
+/// ssh options (single-letter) that consume the following argument.
+const ssh_opts_with_value = "BbcDEeFIiJLlmOopQRSWw";
+
+/// ssh options (single-letter) that imply no interactive shell, so a
+/// persistent session must not be attached.
+const ssh_opts_skip = "TNfnGOW";
+
+/// Returns the index of the destination argument if the given ssh
+/// arguments describe an interactive login session (a destination with
+/// no remote command). Returns null if the session is not interactive
+/// or the destination cannot be determined, in which case no persistent
+/// session should be used.
+fn interactiveDestIdx(args: []const []const u8) ?usize {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+
+        // A bare "-" or "--" is not something we understand; be
+        // conservative and skip the persistent session.
+        if (std.mem.eql(u8, arg, "-") or std.mem.eql(u8, arg, "--")) return null;
+
+        // The first non-option argument is the destination. ssh runs
+        // everything after it as the remote command, so a destination
+        // with trailing arguments is not an interactive login.
+        if (!std.mem.startsWith(u8, arg, "-")) {
+            if (i + 1 < args.len) return null;
+            return i;
+        }
+
+        // Long options are not used by ssh itself; don't guess.
+        if (std.mem.startsWith(u8, arg, "--")) return null;
+
+        // A cluster of single-letter options (e.g. `-vv`). If any
+        // option in the cluster takes a value, it consumes the
+        // following argument.
+        var takes_value = false;
+        for (arg[1..]) |c| {
+            if (std.mem.indexOfScalar(u8, ssh_opts_skip, c) != null) return null;
+            if (std.mem.indexOfScalar(u8, ssh_opts_with_value, c) != null) takes_value = true;
+        }
+        if (takes_value) i += 1;
+    }
+
+    // No destination found.
+    return null;
+}
+
+/// Returns true if the argument needs no quoting to survive a round
+/// trip through a POSIX shell.
+fn shellSafe(arg: []const u8) bool {
+    if (arg.len == 0) return false;
+    for (arg) |c| {
+        const safe = switch (c) {
+            'A'...'Z', 'a'...'z', '0'...'9', '_', '-', '.', '@', '=', '+', ',', ':', '/', '%' => true,
+            else => false,
+        };
+        if (!safe) return false;
+    }
+    return true;
+}
+
+/// Quote an argument for a POSIX shell if necessary.
+fn shellQuote(alloc: Allocator, arg: []const u8) ![]const u8 {
+    if (shellSafe(arg)) return arg;
+
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    defer buf.deinit();
+    const w = &buf.writer;
+
+    try w.writeByte('\'');
+    var start: usize = 0;
+    for (arg, 0..) |c, i| {
+        if (c == '\'') {
+            try w.writeAll(arg[start..i]);
+            try w.writeAll("'\\''");
+            start = i + 1;
+        }
+    }
+    try w.writeAll(arg[start..]);
+    try w.writeByte('\'');
+
+    return try buf.toOwnedSlice();
+}
+
+/// Write the GhosttyRestoreCommand OSC sequence to the controlling
+/// terminal. If `args` is null the restore command is cleared (e.g.
+/// after the ssh session exits); otherwise it is set to `ssh <args>`.
+/// This is best-effort: any failure is ignored so that it can never
+/// break the ssh session itself.
+fn writeRestoreCommand(alloc: Allocator, args: ?[]const []const u8) void {
+    writeRestoreCommandInner(alloc, args) catch {};
+}
+
+fn writeRestoreCommandInner(alloc: Allocator, args_: ?[]const []const u8) !void {
+    if (comptime builtin.os.tag == .windows) return;
+
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    defer buf.deinit();
+    const w = &buf.writer;
+
+    try w.writeAll("\x1b]1337;GhosttyRestoreCommand=");
+    if (args_) |args| {
+        try w.writeAll("ssh");
+        for (args) |arg| {
+            // Refuse to record arguments with control characters; the
+            // value is replayed into a shell when the surface is
+            // restored.
+            for (arg) |c| {
+                if (c < 0x20 or c == 0x7f) return;
+            }
+            try w.writeByte(' ');
+            try w.writeAll(try shellQuote(alloc, arg));
+        }
+    }
+    try w.writeByte('\x07');
+
+    var tty = std.Io.Dir.openFileAbsolute(global.io(), "/dev/tty", .{ .mode = .write_only }) catch return;
+    defer tty.close(global.io());
+    var io_buf: [4096]u8 = undefined;
+    var tty_writer = tty.writer(global.io(), &io_buf);
+    const iface = &tty_writer.interface;
+    iface.writeAll(buf.written()) catch return;
+    iface.flush() catch {};
+}
+
 fn parseTestArgs(alloc: Allocator, opts: *Options, line: []const u8) !void {
     var iter = try std.process.Args.IteratorGeneral(.{}).init(alloc, line);
     defer iter.deinit();
@@ -661,4 +876,69 @@ test "parseDestination: IPv6 hostname" {
     const stdout = "user alice\nhostname ::1\n";
     const result = parseDestination(arena.allocator(), stdout);
     try testing.expectEqualStrings("alice@::1", result.?);
+}
+
+test "interactiveDestIdx: bare destination" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(?usize, 0), interactiveDestIdx(&.{"user@example.com"}));
+}
+
+test "interactiveDestIdx: flags before destination" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(?usize, 3), interactiveDestIdx(&.{ "-p", "2222", "-v", "user@example.com" }));
+}
+
+test "interactiveDestIdx: option cluster with trailing value option" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(?usize, 2), interactiveDestIdx(&.{ "-vvp", "2222", "user@example.com" }));
+}
+
+test "interactiveDestIdx: option with value directly before destination" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(?usize, 2), interactiveDestIdx(&.{ "-o", "Foo=bar", "user@example.com" }));
+}
+
+test "interactiveDestIdx: remote command present" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(?usize, null), interactiveDestIdx(&.{ "user@example.com", "uptime" }));
+}
+
+test "interactiveDestIdx: -T disables pty allocation" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(?usize, null), interactiveDestIdx(&.{ "-T", "user@example.com" }));
+}
+
+test "interactiveDestIdx: -N forwarding only" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(?usize, null), interactiveDestIdx(&.{ "-N", "-L", "8080:localhost:80", "user@example.com" }));
+}
+
+test "interactiveDestIdx: no destination" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(?usize, null), interactiveDestIdx(&.{"-v"}));
+}
+
+test "interactiveDestIdx: unknown long option" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(?usize, null), interactiveDestIdx(&.{ "--something", "user@example.com" }));
+}
+
+test "shellQuote: safe arg unchanged" {
+    const testing = std.testing;
+    const q = try shellQuote(testing.allocator, "user@example.com");
+    try testing.expectEqualStrings("user@example.com", q);
+}
+
+test "shellQuote: quotes special characters" {
+    const testing = std.testing;
+    const q = try shellQuote(testing.allocator, "a b");
+    defer testing.allocator.free(q);
+    try testing.expectEqualStrings("'a b'", q);
+}
+
+test "shellQuote: escapes embedded single quotes" {
+    const testing = std.testing;
+    const q = try shellQuote(testing.allocator, "it's");
+    defer testing.allocator.free(q);
+    try testing.expectEqualStrings("'it'\\''s'", q);
 }

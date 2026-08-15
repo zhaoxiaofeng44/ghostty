@@ -690,6 +690,11 @@ typedef struct {
   const char* pwd;
 } ghostty_action_pwd_s;
 
+// apprt.action.RestoreCommand.C
+typedef struct {
+  const char* restore_command;
+} ghostty_action_restore_command_s;
+
 // apprt.action.OpenConfig
 typedef enum {
   // Open the config in the OS default editor.
@@ -972,6 +977,7 @@ typedef enum {
   GHOSTTY_ACTION_READONLY,
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
   GHOSTTY_ACTION_MOVE_TAB_TO_NEW_WINDOW,
+  GHOSTTY_ACTION_RESTORE_COMMAND,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -993,6 +999,7 @@ typedef union {
   ghostty_action_set_title_s set_tab_title;
   ghostty_action_prompt_title_e prompt_title;
   ghostty_action_pwd_s pwd;
+  ghostty_action_restore_command_s restore_command;
   ghostty_action_mouse_shape_e mouse_shape;
   ghostty_action_mouse_visibility_e mouse_visibility;
   ghostty_action_mouse_over_link_s mouse_over_link;

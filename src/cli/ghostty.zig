@@ -13,6 +13,7 @@ const list_colors = @import("list_colors.zig");
 const list_actions = @import("list_actions.zig");
 const ssh = @import("ssh.zig");
 const ssh_cache = @import("ssh_cache.zig");
+const persist = @import("persist.zig");
 const edit_config = @import("edit_config.zig");
 const show_config = @import("show_config.zig");
 const explain_config = @import("explain_config.zig");
@@ -52,6 +53,9 @@ pub const Action = enum {
 
     /// Wrap `ssh` to configure Ghostty terminal integration on remote hosts
     ssh,
+
+    /// Persistent remote PTY helper (server / attach / status)
+    persist,
 
     /// Manage SSH terminfo cache for automatic remote host setup
     @"ssh-cache",
@@ -161,6 +165,7 @@ pub const Action = enum {
             .@"list-actions" => try list_actions.run(alloc),
             .@"ssh-cache" => try ssh_cache.run(alloc),
             .ssh => try ssh.run(alloc),
+            .persist => try persist.run(alloc),
             .@"edit-config" => try edit_config.run(alloc),
             .@"show-config" => try show_config.run(alloc),
             .@"explain-config" => try explain_config.run(alloc),
@@ -204,6 +209,7 @@ pub const Action = enum {
                 .@"list-actions" => list_actions.Options,
                 .@"ssh-cache" => ssh_cache.Options,
                 .ssh => ssh.Options,
+                .persist => persist.Options,
                 .@"edit-config" => edit_config.Options,
                 .@"show-config" => show_config.Options,
                 .@"explain-config" => explain_config.Options,

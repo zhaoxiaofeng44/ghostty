@@ -8,7 +8,7 @@ export module ghostty {
   # feature flags into command options.
   @complete external
   export def --wrapped ssh [...args] {
-    if not ((has_feature "ssh-env") or (has_feature "ssh-terminfo")) {
+    if not ((has_feature "ssh-env") or (has_feature "ssh-terminfo") or (has_feature "ssh-persist")) {
       ^ssh ...$args
       return
     }
@@ -20,6 +20,9 @@ export module ghostty {
     }
     if not (has_feature "ssh-terminfo") {
       $flags = ($flags ++ ["--terminfo=false"])
+    }
+    if (has_feature "ssh-persist") {
+      $flags = ($flags ++ ["--persist"])
     }
     ^$ghostty "+ssh" ...$flags "--" ...$args
   }

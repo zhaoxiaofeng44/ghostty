@@ -85,6 +85,11 @@ pub const Message = union(enum) {
     /// The terminal has reported a change in the working directory.
     pwd_change: WriteReq,
 
+    /// The terminal has reported a change to the command that should be
+    /// re-run when the surface is restored (e.g. an SSH session started
+    /// via `ghostty +ssh`). An empty value clears the command.
+    restore_command_change: WriteReq,
+
     /// The terminal encountered a bell character.
     ring_bell,
 

@@ -55,6 +55,21 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     /// For example, terminals executing custom scripts are not restorable.
     private var restorable: Bool = true
 
+    /// Whether this window belongs to the single persisted default session.
+    let sessionRole: DefaultWindowSessionRole
+
+    /// Seed of the persisted native tab group. Extra windows are temporary.
+    static weak var persistentSeed: TerminalController?
+
+    var isPersistentSession: Bool { sessionRole == .persistent }
+
+    static var persistentControllers: [TerminalController] {
+        guard let seed = persistentSeed, seed.sessionRole == .persistent else { return [] }
+        let windows = seed.window?.tabGroup?.windows ?? seed.window.map { [$0] } ?? []
+        return windows.compactMap { $0.windowController as? TerminalController }
+            .filter(\.isPersistentSession)
+    }
+
     /// The configuration derived from the Ghostty config so we don't need to rely on references.
     private(set) var derivedConfig: DerivedConfig
 
@@ -64,7 +79,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     init(_ ghostty: Ghostty.App,
          withBaseConfig base: Ghostty.SurfaceConfiguration? = nil,
          withSurfaceTree tree: SplitTree<Ghostty.SurfaceView>? = nil,
-         parent: NSWindow? = nil
+         parent: NSWindow? = nil,
+         sessionRole explicitRole: DefaultWindowSessionRole? = nil
     ) {
         // The window we manage is not restorable if we've specified a command
         // to execute. We do this because the restored window is meaningless at the
@@ -72,11 +88,18 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // as the script. We may want to revisit this behavior when we have scrollback
         // restoration.
         self.restorable = (base?.command ?? "") == ""
+        self.sessionRole = Self.resolvedSessionRole(
+            restorable: self.restorable,
+            explicit: explicitRole)
 
         // Setup our initial derived config based on the current app config
         self.derivedConfig = DerivedConfig(ghostty.config)
 
         super.init(ghostty, baseConfig: base, surfaceTree: tree)
+
+        if sessionRole == .persistent, Self.persistentSeed == nil {
+            Self.persistentSeed = self
+        }
 
         // Setup our notifications for behaviors
         let center = NotificationCenter.default
@@ -174,6 +197,9 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // Whenever our surface tree changes in any way (new split, close split, etc.)
         // we want to invalidate our state.
         invalidateRestorableState()
+        if isPersistentSession, !to.isEmpty {
+            DefaultWindowSessionStore.shared.saveImmediately()
+        }
 
         // Update our zoom state
         if let window = window as? TerminalWindow {
@@ -431,7 +457,10 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         }
 
         // Create a new window and add it to the parent
-        let controller = TerminalController.init(ghostty, withBaseConfig: baseConfig)
+        let controller = TerminalController.init(
+            ghostty,
+            withBaseConfig: baseConfig,
+            sessionRole: parentController.sessionRole)
         controller.isBackgroundOpaque = parentController.isBackgroundOpaque
         guard let window = controller.window else { return controller }
 
@@ -497,6 +526,10 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // solution we should do that.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             controller.relabelTabs()
+        }
+
+        if parentController.isPersistentSession {
+            DefaultWindowSessionStore.shared.saveImmediately()
         }
 
         // Setup our undo
@@ -606,6 +639,9 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         guard tabWindowsHash != v else { return }
         tabWindowsHash = v
         self.relabelTabs()
+        if isPersistentSession {
+            DefaultWindowSessionStore.shared.saveImmediately()
+        }
     }
 
     override func syncAppearance() {
@@ -662,6 +698,10 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         _ node: SplitTree<Ghostty.SurfaceView>.Node,
         withConfirmation: Bool = true
     ) {
+        if isPersistentSession, !surfaceTree.isEmpty {
+            DefaultWindowSessionStore.shared.saveImmediately()
+        }
+
         // If this isn't the root then we're dealing with a split closure.
         if surfaceTree.root != node {
             super.closeSurface(node, withConfirmation: withConfirmation)
@@ -718,6 +758,10 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         }
 
         window.close()
+
+        if isPersistentSession || Self.persistentSeed === self {
+            DefaultWindowSessionStore.shared.saveImmediately()
+        }
     }
 
     private func closeOtherTabsImmediately() {
@@ -811,10 +855,14 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
     /// Closes the current window (including any other tabs) immediately and without
     /// confirmation. This will setup proper undo state so the action can be undone.
-    func closeWindowImmediately() {
+    func closeWindowImmediately(persistSession: Bool = true) {
         guard let window = window else { return }
 
         cancelPendingInitialPresentation()
+
+        if persistSession, isPersistentSession {
+            DefaultWindowSessionStore.shared.saveImmediately()
+        }
 
         registerUndoForCloseWindow()
 
@@ -850,11 +898,12 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 undoManager.setActionName("Close Window")
                 undoManager.registerUndo(
                     withTarget: ghostty,
-                    expiresAfter: undoExpiration) { ghostty in
-                        // Restore the undo state
-                        let newController = TerminalController(ghostty, with: undoState)
+                    expiresAfter: undoExpiration) { [sessionRole] ghostty in
+                        let newController = TerminalController(
+                            ghostty,
+                            with: undoState,
+                            sessionRole: sessionRole)
 
-                        // Register redo action
                         undoManager.registerUndo(
                             withTarget: newController,
                             expiresAfter: newController.undoExpiration) { target in
@@ -907,35 +956,15 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         undoManager.registerUndo(
             withTarget: ghostty,
             expiresAfter: undoExpiration
-        ) { ghostty in
-            // Restore all windows in the tab group
-            let controllers = undoStates.map { undoState in
-                TerminalController(ghostty, with: undoState)
-            }
+        ) { [sessionRole] ghostty in
+            let controllers = TerminalController.restoreTabGroup(
+                ghostty,
+                states: undoStates,
+                keyWindowIndex: keyWindowIndex,
+                sessionRole: sessionRole)
 
-            // The first controller becomes the parent window for all tabs.
-            // If we don't have a first controller (shouldn't be possible?)
-            // then we can't restore tabs.
             guard let firstController = controllers.first else { return }
 
-            // Add all subsequent controllers as tabs to the first window
-            for controller in controllers.dropFirst() {
-                controller.showWindow(nil)
-                if let firstWindow = firstController.window,
-                   let newWindow = controller.window {
-                    firstWindow.addTabbedWindowSafely(newWindow, ordered: .above)
-                }
-            }
-
-            // Make the appropriate window key. If we had a key window, restore it.
-            // Otherwise, make the last window key.
-            if let keyWindowIndex, keyWindowIndex < controllers.count {
-                controllers[keyWindowIndex].window?.makeKeyAndOrderFront(nil)
-            } else {
-                controllers.last?.window?.makeKeyAndOrderFront(nil)
-            }
-
-            // Register redo action on the first controller
             undoManager.registerUndo(
                 withTarget: firstController,
                 expiresAfter: firstController.undoExpiration
@@ -993,10 +1022,19 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         let tabIndex: Int?
         weak var tabGroup: NSWindowTabGroup?
         let tabColor: TerminalTabColor
+        let titleOverride: String?
+        let effectiveFullscreenMode: FullscreenMode?
     }
 
-    convenience init(_ ghostty: Ghostty.App, with undoState: UndoState) {
-        self.init(ghostty, withSurfaceTree: undoState.surfaceTree)
+    convenience init(
+        _ ghostty: Ghostty.App,
+        with undoState: UndoState,
+        sessionRole: DefaultWindowSessionRole? = nil
+    ) {
+        self.init(
+            ghostty,
+            withSurfaceTree: undoState.surfaceTree,
+            sessionRole: sessionRole)
 
         // Show the window and restore its frame
         showWindow(nil)
@@ -1021,6 +1059,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 window.makeKeyAndOrderFront(nil)
             }
 
+            titleOverride = undoState.titleOverride
+
             // Restore focus to the previously focused surface
             if let focusedUUID = undoState.focusedSurface,
                let focusTarget = surfaceTree.first(where: { $0.id == focusedUUID }) {
@@ -1033,6 +1073,12 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 self.focusedSurface = focusedSurface
                 DispatchQueue.main.async {
                     Ghostty.moveFocus(to: focusedSurface, from: nil)
+                }
+            }
+
+            if let mode = undoState.effectiveFullscreenMode, mode != .native {
+                DispatchQueue.main.async {
+                    self.toggleFullscreen(mode: mode)
                 }
             }
         }
@@ -1048,7 +1094,92 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             focusedSurface: focusedSurface?.id,
             tabIndex: window.tabGroup?.windows.firstIndex(of: window),
             tabGroup: window.tabGroup,
-            tabColor: (window as? TerminalWindow)?.tabColor ?? .none)
+            tabColor: (window as? TerminalWindow)?.tabColor ?? .none,
+            titleOverride: titleOverride,
+            effectiveFullscreenMode: fullscreenStyle?.fullscreenMode)
+    }
+
+    static func restoreTabGroup(
+        _ ghostty: Ghostty.App,
+        states: [UndoState],
+        keyWindowIndex: Int?,
+        sessionRole: DefaultWindowSessionRole
+    ) -> [TerminalController] {
+        let controllers = states.map { undoState in
+            TerminalController(ghostty, with: undoState, sessionRole: sessionRole)
+        }
+
+        guard let firstController = controllers.first else { return [] }
+
+        for controller in controllers.dropFirst() {
+            controller.showWindow(nil)
+            if let firstWindow = firstController.window,
+               let newWindow = controller.window {
+                firstWindow.addTabbedWindowSafely(newWindow, ordered: .above)
+            }
+        }
+
+        if let keyWindowIndex, keyWindowIndex < controllers.count {
+            controllers[keyWindowIndex].window?.makeKeyAndOrderFront(nil)
+        } else {
+            controllers.last?.window?.makeKeyAndOrderFront(nil)
+        }
+
+        return controllers
+    }
+
+    @discardableResult
+    static func restoreDefaultSessionIfNeeded(_ ghostty: Ghostty.App) -> Bool {
+        guard ghostty.config.windowSaveState != "never" else { return false }
+        guard let app = ghostty.app else { return false }
+        guard let session = DefaultWindowSessionStore.shared.load(), !session.tabs.isEmpty else {
+            return false
+        }
+
+        let existing = all
+        if !existing.isEmpty {
+            let existingHasSplits = existing.contains { $0.surfaceTree.isSplit || $0.window?.tabGroup?.windows.count ?? 0 > 1 }
+            let snapshotHasSplits = session.tabs.count > 1 || session.tabs.contains {
+                if case .split = $0.surfaceTree { return true }
+                return false
+            }
+            if existingHasSplits || !snapshotHasSplits {
+                return true
+            }
+            existing.forEach { $0.closeWindowImmediately(persistSession: false) }
+        }
+
+        let states = session.tabs.enumerated().map { index, tab in
+            UndoState(
+                frame: tab.frame,
+                surfaceTree: tab.makeSurfaceTree(app: app),
+                focusedSurface: tab.focusedSurfaceID,
+                tabIndex: index,
+                tabGroup: nil,
+                tabColor: tab.tabColor ?? .none,
+                titleOverride: tab.titleOverride,
+                effectiveFullscreenMode: tab.effectiveFullscreenMode)
+        }
+
+        let selected = min(max(session.selectedTabIndex, 0), states.count - 1)
+        let controllers = restoreTabGroup(
+            ghostty,
+            states: states,
+            keyWindowIndex: selected,
+            sessionRole: .persistent)
+        persistentSeed = controllers.indices.contains(selected)
+            ? controllers[selected]
+            : controllers.first
+        return !controllers.isEmpty
+    }
+
+    private static func resolvedSessionRole(
+        restorable: Bool,
+        explicit: DefaultWindowSessionRole?
+    ) -> DefaultWindowSessionRole {
+        if let explicit { return explicit }
+        guard restorable else { return .temporary }
+        return persistentSeed == nil ? .persistent : .temporary
     }
 
     // MARK: - NSWindowController
@@ -1068,12 +1199,10 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // use whatever the latest app-level config is.
         let config = ghostty.config
 
-        // Setting all three of these is required for restoration to work.
-        window.isRestorable = restorable
-        if restorable {
-            window.restorationClass = TerminalWindowRestoration.self
-            window.identifier = .init(String(describing: TerminalWindowRestoration.self))
-        }
+        // Default-window sessions persist through DefaultWindowSessionStore
+        // rather than AppKit NSWindowRestoration. AppKit restore can race our
+        // snapshot and bring back a stale single-pane window.
+        window.isRestorable = false
 
         // If we have only a single surface (no splits) and there is a default size then
         // we should resize to that default size.
@@ -1186,6 +1315,10 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     lazy private(set) var tabGroupCloseCoordinator = TabGroupCloseCoordinator()
 
     override func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if isPersistentSession, !surfaceTree.isEmpty {
+            DefaultWindowSessionStore.shared.saveImmediately()
+        }
+
         tabGroupCloseCoordinator.windowShouldClose(sender) { [weak self] scope in
             guard let self else { return }
             switch scope {
@@ -1203,6 +1336,9 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     override func windowWillClose(_ notification: Notification) {
         super.windowWillClose(notification)
         cancelPendingInitialPresentation()
+        if Self.persistentSeed === self {
+            Self.persistentSeed = Self.persistentControllers.first { $0 !== self }
+        }
         self.relabelTabs()
 
         // If we remove a window, we reset the cascade point to the key window so that

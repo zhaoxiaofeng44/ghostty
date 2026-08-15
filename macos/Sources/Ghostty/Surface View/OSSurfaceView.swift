@@ -1,6 +1,8 @@
 import Foundation
 import GhosttyKit
 import SwiftUI
+import Darwin.sys.proc
+import Darwin.POSIX
 
 extension Ghostty {
     class OSSurfaceView: NSView, ObservableObject {
@@ -12,6 +14,18 @@ extension Ghostty {
         // The current pwd of the surface as defined by the pty. This can be
         // changed with escape codes.
         @Published var pwd: String?
+
+        // Newest-first working directories visited by this surface. The
+        // current pwd is always first when history has been recorded.
+        private(set) var recentWorkingDirectories: [String] = []
+
+        static let recentWorkingDirectoryLimit = 10
+
+        // The command that should be re-run when this surface is restored
+        // (e.g. an SSH session managed by `ghostty +ssh --tmux`). This is
+        // set and cleared by the core via escape sequences. An empty value
+        // is stored as nil.
+        var restoreCommand: String?
 
         // The cell size of this surface. This is set by the core when the
         // surface is first created and any time the cell size changes (i.e.
@@ -103,6 +117,46 @@ extension Ghostty {
         @MainActor
         func endSearch() {
             searchState = nil
+        }
+
+        func recordWorkingDirectory(_ path: String) {
+            pwd = path
+            recentWorkingDirectories = Self.updatedRecentWorkingDirectories(
+                recentWorkingDirectories,
+                recording: path)
+        }
+
+        func restoreRecentWorkingDirectories(_ directories: [String]) {
+            recentWorkingDirectories = Array(directories.prefix(Self.recentWorkingDirectoryLimit))
+        }
+
+        static func processWorkingDirectory(pid: pid_t) -> String? {
+            var info = proc_vnodepathinfo()
+            let size = Int32(MemoryLayout<proc_vnodepathinfo>.size)
+            let result = withUnsafeMutablePointer(to: &info) { pointer in
+                proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, pointer, size)
+            }
+            guard result == size else { return nil }
+
+            let path = withUnsafePointer(to: info.pvi_cdir.vip_path) {
+                $0.withMemoryRebound(to: CChar.self, capacity: MemoryLayout.size(ofValue: info.pvi_cdir.vip_path)) {
+                    String(cString: $0)
+                }
+            }
+            return path.isEmpty ? nil : path
+        }
+
+        static func updatedRecentWorkingDirectories(
+            _ current: [String],
+            recording path: String,
+            limit: Int = recentWorkingDirectoryLimit
+        ) -> [String] {
+            var next = current.filter { $0 != path }
+            next.insert(path, at: 0)
+            if next.count > limit {
+                next.removeLast(next.count - limit)
+            }
+            return next
         }
 
         // MARK: - Placeholders

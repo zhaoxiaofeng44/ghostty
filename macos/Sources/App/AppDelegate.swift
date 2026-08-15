@@ -367,9 +367,12 @@ class AppDelegate: NSObject,
             // is possible to have other windows in a few scenarios:
             //   - if we're opening a URL since `application(_:openFile:)` is called before this.
             //   - if we're restoring from persisted state
-            if TerminalController.all.isEmpty && derivedConfig.initialWindow {
+            if derivedConfig.initialWindow {
                 undoManager.disableUndoRegistration()
-                _ = TerminalController.newWindow(ghostty)
+                if !TerminalController.restoreDefaultSessionIfNeeded(ghostty),
+                   TerminalController.all.isEmpty {
+                    _ = TerminalController.newWindow(ghostty)
+                }
                 undoManager.enableUndoRegistration()
             }
         }
@@ -380,6 +383,8 @@ class AppDelegate: NSObject,
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        DefaultWindowSessionStore.shared.saveImmediately()
+
         let windows = NSApplication.shared.windows
         if windows.isEmpty { return .terminateNow }
 
@@ -414,6 +419,8 @@ class AppDelegate: NSObject,
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        DefaultWindowSessionStore.shared.flush()
+
         // We have no notifications we want to persist after death,
         // so remove them all now. In the future we may want to be
         // more selective and only remove surface-targeted notifications.
@@ -438,8 +445,10 @@ class AppDelegate: NSObject,
         // but I haven't seen it happen in releases. I'm unsure why.
         guard applicationHasBecomeActive else { return true }
 
-        // No visible windows, open a new one.
-        _ = TerminalController.newWindow(ghostty)
+        // No visible windows, restore the default session or open a new one.
+        if !TerminalController.restoreDefaultSessionIfNeeded(ghostty) {
+            _ = TerminalController.newWindow(ghostty)
+        }
         return false
     }
 

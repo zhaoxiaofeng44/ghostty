@@ -1085,6 +1085,21 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             );
         },
 
+        .restore_command_change => |w| {
+            defer w.deinit();
+
+            var stack = std.heap.stackFallback(256, self.alloc);
+            const alloc = stack.get();
+            const str = try alloc.dupeZ(u8, w.slice());
+            defer alloc.free(str);
+
+            _ = try self.rt_app.performAction(
+                .{ .surface = self },
+                .restore_command,
+                .{ .restore_command = str },
+            );
+        },
+
         .close => self.close(),
 
         .child_exited => |v| self.childExited(v),
