@@ -58,15 +58,41 @@ pub const Options = struct {
         return Action.help_error;
     }
 
+    /// Swallows the value-required error for a bare `--session` whose
+    /// value was already consumed by `parseManuallyHook`. Other parse
+    /// errors for the flag are still reported.
+    pub const compatibility = std.StaticStringMap(
+        args.CompatibilityHandler(Options),
+    ).initComptime(.{
+        .{ "session", sessionCompat },
+    });
+
+    fn sessionCompat(
+        _: *Options,
+        _: Allocator,
+        _: []const u8,
+        value: ?[]const u8,
+    ) bool {
+        return value == null;
+    }
+
     /// Manual parse hook. A literal `--` or any non-flag argument starts
     /// the command; it and everything after it is collected verbatim and
-    /// flag parsing stops.
+    /// flag parsing stops. A bare `--session` consumes the following
+    /// argument as its value so both `--session <name>` and
+    /// `--session=<name>` forms work; the `compatibility` handler above
+    /// keeps the generic parser from rejecting the value-less flag.
     pub fn parseManuallyHook(
         self: *Options,
         alloc: Allocator,
         arg: []const u8,
         iter: anytype,
     ) Allocator.Error!bool {
+        if (std.mem.eql(u8, arg, "--session")) {
+            if (iter.next()) |name| self.session = try alloc.dupe(u8, name);
+            return true;
+        }
+
         if (std.mem.eql(u8, arg, "--")) {
             while (iter.next()) |rest| {
                 try self._command.append(alloc, try alloc.dupe(u8, rest));
@@ -195,16 +221,24 @@ pub fn run(alloc_gpa: Allocator) !u8 {
     var opts: Options = .{};
     defer opts.deinit();
 
-    {
-        var iter = try args.argsIterator(alloc_gpa, global.args());
-        defer iter.deinit();
-        try args.parse(Options, alloc_gpa, &opts, &iter);
-    }
-
     var stderr_buffer: [1024]u8 = undefined;
     var stderr_file: std.Io.File = .stderr();
     var stderr_writer = stderr_file.writer(global.io(), &stderr_buffer);
     const stderr = &stderr_writer.interface;
+
+    {
+        var iter = args.argsIterator(alloc_gpa, global.args()) catch |err| {
+            stderr.print("Error: could not read arguments: {t}\n", .{err}) catch {};
+            stderr.flush() catch {};
+            return 1;
+        };
+        defer iter.deinit();
+        args.parse(Options, alloc_gpa, &opts, &iter) catch |err| {
+            stderr.print("Error: invalid arguments: {t}\n\n{s}", .{ err, usage }) catch {};
+            stderr.flush() catch {};
+            return 2;
+        };
+    }
 
     const modes: u3 = @intFromBool(opts.server) + @intFromBool(opts.attach) + @intFromBool(opts.status);
     if (modes != 1 or opts.session == null or opts.session.?.len == 0) {
@@ -807,6 +841,48 @@ fn daemonize() !void {
         _ = posix.system.dup2(devnull, posix.STDERR_FILENO);
         if (devnull > posix.STDERR_FILENO) closeFd(devnull);
     }
+}
+
+fn parseTestArgs(alloc: Allocator, opts: *Options, line: []const u8) !void {
+    var iter = try std.process.Args.IteratorGeneral(.{}).init(alloc, line);
+    defer iter.deinit();
+    try args.parse(Options, alloc, opts, &iter);
+}
+
+test "parse: --session with space-separated value" {
+    const testing = std.testing;
+    var opts: Options = .{};
+    defer opts.deinit();
+    try parseTestArgs(
+        testing.allocator,
+        &opts,
+        "--server --session my-session -- /bin/sh -c hi",
+    );
+    try testing.expect(opts.server);
+    try testing.expectEqualStrings("my-session", opts.session.?);
+    try testing.expectEqual(@as(usize, 3), opts._command.items.len);
+}
+
+test "parse: --session=value form still works" {
+    const testing = std.testing;
+    var opts: Options = .{};
+    defer opts.deinit();
+    try parseTestArgs(
+        testing.allocator,
+        &opts,
+        "--attach --session=my-session",
+    );
+    try testing.expect(opts.attach);
+    try testing.expectEqualStrings("my-session", opts.session.?);
+}
+
+test "parse: bare --session without value leaves session unset" {
+    const testing = std.testing;
+    var opts: Options = .{};
+    defer opts.deinit();
+    try parseTestArgs(testing.allocator, &opts, "--server --session");
+    try testing.expect(opts.server);
+    try testing.expect(opts.session == null);
 }
 
 test "frame encode decode" {
