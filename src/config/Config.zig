@@ -2939,6 +2939,17 @@ keybind: Keybinds = .{},
 ///     cache manually using various arguments.
 ///     (Available since: 1.2.0)
 ///
+///   * `ssh-persist` - Enable persistent remote sessions. Interactive `ssh`
+///     connections run inside a Ghostty-managed session daemon
+///     (`ghostty +persist`) that keeps the connection and its remote
+///     processes alive when the local terminal is closed. Ghostty
+///     remembers the `ssh` command and re-runs it when the terminal is
+///     restored, reattaching to the session automatically. If the
+///     connection itself is lost (network drop, sshd restart), the
+///     daemon reconnects with backoff while the session lives. Nothing
+///     needs to be installed on the remote host. Non-interactive ssh
+///     usage (remote commands, `-N` forwarding, etc.) is not affected.
+///
 ///   * `path` - Add Ghostty's binary directory to PATH. This ensures the `ghostty`
 ///     command is available in the shell even if shell init scripts reset PATH.
 ///     This is particularly useful on macOS where PATH is often overridden by
@@ -8748,6 +8759,7 @@ pub const ShellIntegrationFeatures = packed struct {
     title: bool = true,
     @"ssh-env": bool = false,
     @"ssh-terminfo": bool = false,
+    @"ssh-persist": bool = false,
     path: bool = true,
 };
 

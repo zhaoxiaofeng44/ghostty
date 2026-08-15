@@ -163,6 +163,14 @@ pub const Command = union(Key) {
     /// https://uapi-group.org/specifications/specs/osc_context/
     context_signal: parsers.context_signal.Command,
 
+    /// OSC 1337 Ghostty extension (GhosttyRestoreCommand). Sets the command
+    /// that should be re-run when this surface is restored, e.g. after the
+    /// app is restarted. An empty value clears the command. This is used by
+    /// the `ghostty +ssh` integration to restore remote sessions. The value
+    /// is not checked for validity; it is up to the apprt to validate it
+    /// before using it.
+    restore_command: [:0]const u8,
+
     pub const SemanticPrompt = parsers.semantic_prompt.Command;
 
     pub const KittyClipboardProtocol = parsers.kitty_clipboard_protocol.OSC;
@@ -199,6 +207,7 @@ pub const Command = union(Key) {
             "kitty_clipboard_protocol",
             "kitty_dnd_protocol",
             "context_signal",
+            "restore_command",
         },
     );
 
@@ -445,6 +454,7 @@ pub const Parser = struct {
             .kitty_clipboard_protocol,
             .kitty_dnd_protocol,
             .context_signal,
+            .restore_command,
             => {},
         }
 

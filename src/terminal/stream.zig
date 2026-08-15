@@ -128,6 +128,7 @@ pub const Action = union(Key) {
     kitty_color_report: kitty.color.OSC,
     color_operation: ColorOperation,
     semantic_prompt: SemanticPrompt,
+    restore_command: RestoreCommand,
 
     pub const Key = lib.Enum(
         lib.target,
@@ -227,6 +228,7 @@ pub const Action = union(Key) {
             "kitty_color_report",
             "color_operation",
             "semantic_prompt",
+            "restore_command",
         },
     );
 
@@ -372,6 +374,17 @@ pub const Action = union(Key) {
 
         pub fn cval(self: ReportPwd) ReportPwd.C {
             return .init(self.url);
+        }
+    };
+
+    pub const RestoreCommand = struct {
+        command: [:0]const u8,
+
+        pub const C = lib.String;
+
+        pub fn cval(self: RestoreCommand) RestoreCommand.C {
+            const command: []const u8 = self.command;
+            return .init(command);
         }
     };
 
@@ -2499,6 +2512,10 @@ pub fn Stream(comptime H: type) type {
                 .report_pwd => |v| {
                     @branchHint(.likely);
                     self.handler.vt(.report_pwd, .{ .url = v.value });
+                },
+
+                .restore_command => |v| {
+                    self.handler.vt(.restore_command, .{ .command = v });
                 },
 
                 .mouse_shape => |v| {

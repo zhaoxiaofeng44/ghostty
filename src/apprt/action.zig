@@ -357,6 +357,11 @@ pub const Action = union(Key) {
     /// Move a tab to a new window.
     move_tab_to_new_window,
 
+    /// The command that should be re-run when the target surface is
+    /// restored (e.g. after the app is restarted). An empty value
+    /// clears the command.
+    restore_command: RestoreCommand,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -428,6 +433,7 @@ pub const Action = union(Key) {
         readonly,
         copy_title_to_clipboard,
         move_tab_to_new_window,
+        restore_command,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -782,6 +788,21 @@ pub const Pwd = struct {
         writer: *std.Io.Writer,
     ) !void {
         try writer.print("{s}{{ {s} }}", .{ @typeName(@This()), value.pwd });
+    }
+};
+
+pub const RestoreCommand = struct {
+    restore_command: [:0]const u8,
+
+    // Sync with: ghostty_action_restore_command_s
+    pub const C = extern struct {
+        restore_command: [*:0]const u8,
+    };
+
+    pub fn cval(self: RestoreCommand) C {
+        return .{
+            .restore_command = self.restore_command.ptr,
+        };
     }
 };
 

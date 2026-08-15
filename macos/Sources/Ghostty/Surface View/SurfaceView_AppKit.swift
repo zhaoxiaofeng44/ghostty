@@ -394,6 +394,10 @@ extension Ghostty {
             }
             self.surfaceModel = Ghostty.Surface(cSurface: surface)
 
+            if let workingDirectory = surface_cfg.workingDirectory, !workingDirectory.isEmpty {
+                recordWorkingDirectory(workingDirectory)
+            }
+
             // Setup our tracking area so we get mouse moved events
             updateTrackingAreas()
 
@@ -1857,6 +1861,8 @@ extension Ghostty {
             case uuid
             case title
             case isUserSetTitle
+            case restoreCommand
+            case recentWorkingDirectories
         }
 
         required convenience init(from decoder: Decoder) throws {
@@ -1874,16 +1880,23 @@ extension Ghostty {
             let savedTitle = try container.decodeIfPresent(String.self, forKey: .title)
             let isUserSetTitle = try container.decodeIfPresent(Bool.self, forKey: .isUserSetTitle) ?? false
 
+            // If we have a valid restore command then we replay it into
+            // the shell as initial input so that the surface picks up
+            // where it left off (e.g. reattaching to a persistent SSH
+            // session).
+            if let restoreCommand = try container.decodeIfPresent(String.self, forKey: .restoreCommand),
+               Self.validRestoreCommand(restoreCommand) {
+                config.initialInput = restoreCommand + "\n"
+            }
+
             self.init(app, baseConfig: config, uuid: uuid)
 
-            // Restore the saved title after initialization
-            if let title = savedTitle {
-                self.title = title
-                // If this was a user-set title, we need to prevent it from being overwritten
-                if isUserSetTitle {
-                    self.titleFromTerminal = title
-                }
-            }
+            applyRestoredSession(
+                title: savedTitle,
+                isUserSetTitle: isUserSetTitle,
+                recentWorkingDirectories: try container.decodeIfPresent(
+                    [String].self,
+                    forKey: .recentWorkingDirectories) ?? [])
         }
 
         func encode(to encoder: Encoder) throws {
@@ -1892,6 +1905,46 @@ extension Ghostty {
             try container.encode(id.uuidString, forKey: .uuid)
             try container.encode(title, forKey: .title)
             try container.encode(titleFromTerminal != nil, forKey: .isUserSetTitle)
+            try container.encodeIfPresent(restoreCommand, forKey: .restoreCommand)
+            if !recentWorkingDirectories.isEmpty {
+                try container.encode(recentWorkingDirectories, forKey: .recentWorkingDirectories)
+            }
+        }
+
+        var isUserSetTitle: Bool { titleFromTerminal != nil }
+
+        func applyRestoredSession(
+            title: String?,
+            isUserSetTitle: Bool,
+            recentWorkingDirectories: [String]
+        ) {
+            if let title {
+                self.title = title
+                if isUserSetTitle {
+                    self.titleFromTerminal = title
+                }
+            }
+            var history = recentWorkingDirectories
+            if let pwd, !pwd.isEmpty {
+                history = Self.updatedRecentWorkingDirectories(history, recording: pwd)
+            }
+            restoreRecentWorkingDirectories(history)
+        }
+
+        /// Validates a persisted restore command before it is replayed
+        /// into a shell. The command is injected as initial input into a
+        /// freshly started shell on restore, so a malicious value could
+        /// execute arbitrary code. We only allow plain ssh invocations
+        /// without control characters, which is what the `ghostty +ssh`
+        /// integration reports.
+        static func validRestoreCommand(_ command: String) -> Bool {
+            guard command.hasPrefix("ssh ") else { return false }
+            guard command.count <= 4096 else { return false }
+            for scalar in command.unicodeScalars {
+                let value = scalar.value
+                if value < 0x20 || value == 0x7F { return false }
+            }
+            return true
         }
     }
 }
